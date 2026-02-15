@@ -1,0 +1,7 @@
+﻿  builder_main.c
+C:\Users\livorno\source\repos\2Pack\Buillder\builder_main.c(72,35): warning C4133: 'function': incompatible types - from 'LPWSTR' to 'LPCSTR'
+  Generating code
+  Previous IPDB not found, fall back to full compilation.
+  All 10 functions were compiled because no usable IPDB/IOBJ from previous compilation was found.
+  Finished generating code
+  Buillder.vcxproj -> C:\Users\livorno\source\repos\2Pack\x64\Release\Buillder.exe

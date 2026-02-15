@@ -1,2 +1,3 @@
 ﻿  builder_main.c
+C:\Users\livorno\source\repos\2Pack\Buillder\builder_main.c(72,35): warning C4133: 'function': incompatible types - from 'LPWSTR' to 'LPCSTR'
   Buillder.vcxproj -> C:\Users\livorno\source\repos\2Pack\x64\Debug\Buillder.exe
